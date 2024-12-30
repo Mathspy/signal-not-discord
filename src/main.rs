@@ -67,6 +67,8 @@ async fn manager_runtime() -> Sender<String> {
                 }
             });
 
+            eprintln!("Ready to send messages out!");
+
             while let Some(msg) = rx.recv().await {
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(UNIX_EPOCH)
