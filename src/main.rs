@@ -157,6 +157,7 @@ impl fmt::Display for Payload {
 
 #[derive(Deserialize)]
 struct Options {
+    #[serde(default)]
     wait: bool,
 }
 
