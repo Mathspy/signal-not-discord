@@ -114,12 +114,14 @@ struct EmbedField {
 struct Embed {
     title: Option<String>,
     description: Option<String>,
+    #[serde(default)]
     fields: Vec<EmbedField>,
 }
 
 #[derive(Deserialize, Debug)]
 struct Payload {
     content: Option<String>,
+    #[serde(default)]
     embeds: Vec<Embed>,
     #[serde(flatten)]
     _other: BTreeMap<String, Value>,
