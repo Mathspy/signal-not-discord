@@ -1,7 +1,13 @@
-use std::{collections::BTreeMap, time::UNIX_EPOCH};
+use std::{
+    collections::BTreeMap,
+    fmt::{self, Write},
+    time::UNIX_EPOCH,
+};
 
 use axum::{
-    extract::{self, State},
+    body::Body,
+    extract::{Query, State},
+    response::{IntoResponse, NoContent},
     routing, Json, Router,
 };
 use futures_util::{pin_mut, StreamExt};
@@ -85,6 +91,8 @@ async fn manager_runtime() -> Sender<String> {
                     )
                     .await
                     .expect("failed to send message");
+
+                eprintln!("Message sent");
             }
         });
 
@@ -95,14 +103,67 @@ async fn manager_runtime() -> Sender<String> {
 }
 
 #[derive(Deserialize, Debug)]
+struct EmbedField {
+    name: String,
+    value: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct Embed {
+    title: Option<String>,
+    description: Option<String>,
+    fields: Vec<EmbedField>,
+}
+
+#[derive(Deserialize, Debug)]
 struct Payload {
-    content: String,
+    content: Option<String>,
+    embeds: Vec<Embed>,
     #[serde(flatten)]
-    other: BTreeMap<String, Value>,
+    _other: BTreeMap<String, Value>,
+}
+
+impl fmt::Display for Payload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(content) = &self.content {
+            f.write_str(content)?;
+            f.write_char('\n')?;
+            f.write_char('\n')?;
+        }
+
+        for embed in &self.embeds {
+            if let Some(title) = &embed.title {
+                f.write_str(title)?;
+                f.write_char('\n')?;
+            }
+
+            if let Some(description) = &embed.description {
+                f.write_str(description)?;
+                f.write_char('\n')?;
+                f.write_char('\n')?;
+            }
+
+            for field in &embed.fields {
+                f.write_str(&field.name)?;
+                f.write_str(": ")?;
+                f.write_str(&field.value)?;
+                f.write_char('\n')?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct Options {
+    wait: bool,
 }
 
 #[derive(Serialize)]
-struct Response {}
+struct Response {
+    id: &'static str,
+}
 
 async fn async_main() {
     let channel = manager_runtime().await;
@@ -116,14 +177,22 @@ async fn async_main() {
 
 async fn handler(
     State(channel): State<Sender<String>>,
-    Json(payload): extract::Json<Payload>,
-) -> Json<Response> {
-    eprintln!("{payload:?}");
-    // let _ = channel.send(payload.content).await.map_err(|err| {
-    //     println!("Error couldn't send message: {err}");
-    // });
+    Query(query): Query<Options>,
+    Json(payload): Json<Payload>,
+) -> axum::http::Response<Body> {
+    eprintln!("Sending: {payload:?}");
+    let _ = channel.send(payload.to_string()).await.map_err(|err| {
+        println!("Error couldn't send message: {err}");
+    });
 
-    Json(Response {})
+    if query.wait {
+        Json(Response {
+            id: "1322948599578890240",
+        })
+        .into_response()
+    } else {
+        NoContent.into_response()
+    }
 }
 
 fn main() {
