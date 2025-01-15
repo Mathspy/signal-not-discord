@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, NoContent},
     routing, Json, Router,
 };
-use futures_util::{pin_mut, StreamExt};
+use futures_util::{pin_mut, Stream, StreamExt};
 use presage::{
     libsignal_service::{prelude::Uuid, protocol::ServiceId},
     manager::ReceivingMode,
@@ -23,85 +23,130 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
     runtime,
-    sync::mpsc::{self, Sender},
+    sync::mpsc::{self, Receiver, Sender},
     task::{self, yield_now, LocalSet},
 };
+use tokio_stream::wrappers::ReceiverStream;
 
-async fn manager_runtime() -> Sender<String> {
-    let db_path = std::env::var("DB_PATH").expect("DB_PATH env variable to be set");
-    let signal_user_uuid =
-        std::env::var("SIGNAL_USER_UUID").expect("DB_PATH env variable to be set");
+trait SignalMessageSender: Clone {
+    async fn send(&mut self, msg: String) -> Result<(), Box<dyn std::error::Error>>;
+}
 
-    let (tx, mut rx) = mpsc::channel(8);
-    let rt = runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+trait SignalMessageReceiver {
+    fn create_stream(self) -> Result<impl Stream<Item = String>, Box<dyn std::error::Error>>;
+}
 
-    std::thread::spawn(move || {
-        let local = LocalSet::new();
-
-        local.spawn_local(async move {
-            let store = SledStore::open_with_passphrase(
-                db_path,
-                None::<&str>,
-                MigrationConflictStrategy::Raise,
-                OnNewIdentity::Reject,
-            )
-            .await
-            .expect("Database to exist and be accessible");
-            let mut manager = Manager::load_registered(store)
-                .await
-                .expect("manager is able to boot up from database correctly");
-
-            let mut receiving_manager = manager.clone();
-            task::spawn_local(async move {
-                let messages = receiving_manager
-                    .receive_messages(ReceivingMode::Forever)
+async fn signal_pipe<T, R>(sender: T, receiver: R)
+where
+    T: SignalMessageSender,
+    R: SignalMessageReceiver,
+{
+    receiver
+        .create_stream()
+        .expect("creating stream failed")
+        .for_each(|msg| {
+            let mut sender = sender.clone();
+            async move {
+                sender
+                    .send(msg)
                     .await
-                    .expect("failed to initialize messages stream");
-                pin_mut!(messages);
+                    .expect("receiver failed to receive message");
+            }
+        })
+        .await
+}
 
-                while (messages.next().await).is_some() {
-                    yield_now().await;
+#[derive(Clone)]
+struct CoreSender {
+    internal: Sender<String>,
+}
+
+impl CoreSender {
+    fn new() -> Self {
+        let db_path = std::env::var("DB_PATH").expect("DB_PATH env variable to be set");
+        let signal_user_uuid =
+            std::env::var("SIGNAL_USER_UUID").expect("DB_PATH env variable to be set");
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let rt = runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        std::thread::spawn(move || {
+            let local = LocalSet::new();
+
+            local.spawn_local(async move {
+                let store = SledStore::open_with_passphrase(
+                    db_path,
+                    None::<&str>,
+                    MigrationConflictStrategy::Raise,
+                    OnNewIdentity::Reject,
+                )
+                .await
+                .expect("Database to exist and be accessible");
+                let mut manager = Manager::load_registered(store)
+                    .await
+                    .expect("manager is able to boot up from database correctly");
+
+                let mut receiving_manager = manager.clone();
+                task::spawn_local(async move {
+                    let messages = receiving_manager
+                        .receive_messages(ReceivingMode::Forever)
+                        .await
+                        .expect("failed to initialize messages stream");
+                    pin_mut!(messages);
+
+                    while (messages.next().await).is_some() {
+                        yield_now().await;
+                    }
+                });
+
+                eprintln!("Ready to send messages out!");
+
+                while let Some(msg) = rx.recv().await {
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("Time went backwards")
+                        .as_millis() as u64;
+
+                    let message = DataMessage {
+                        body: Some(msg),
+                        timestamp: Some(timestamp),
+                        ..Default::default()
+                    };
+
+                    manager
+                        .send_message(
+                            ServiceId::Aci(
+                                Uuid::try_parse(&signal_user_uuid)
+                                    .expect("is valid UUID")
+                                    .into(),
+                            ),
+                            message,
+                            timestamp,
+                        )
+                        .await
+                        .expect("failed to send message");
+
+                    eprintln!("Message sent");
                 }
             });
 
-            eprintln!("Ready to send messages out!");
-
-            while let Some(msg) = rx.recv().await {
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("Time went backwards")
-                    .as_millis() as u64;
-
-                let message = DataMessage {
-                    body: Some(msg),
-                    timestamp: Some(timestamp),
-                    ..Default::default()
-                };
-
-                manager
-                    .send_message(
-                        ServiceId::Aci(
-                            Uuid::try_parse(&signal_user_uuid)
-                                .expect("is valid UUID")
-                                .into(),
-                        ),
-                        message,
-                        timestamp,
-                    )
-                    .await
-                    .expect("failed to send message");
-
-                eprintln!("Message sent");
-            }
+            rt.block_on(local);
         });
 
-        rt.block_on(local);
-    });
+        Self { internal: tx }
+    }
+}
 
-    tx
+impl SignalMessageSender for CoreSender {
+    async fn send(&mut self, msg: String) -> Result<(), Box<dyn std::error::Error>> {
+        self.internal
+            .send(msg)
+            .await
+            .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -170,14 +215,35 @@ struct Response {
     id: &'static str,
 }
 
-async fn async_main() {
-    let channel = manager_runtime().await;
+struct HttpReceiver {
+    internal: Receiver<String>,
+}
 
-    let app = Router::new()
-        .route("/webhooks/:id/:token", routing::post(handler))
-        .with_state(channel);
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+impl HttpReceiver {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel(8);
+        tokio::spawn(async {
+            let app = Router::new()
+                .route("/webhooks/:id/:token", routing::post(handler))
+                .with_state(tx);
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        Self { internal: rx }
+    }
+}
+
+impl SignalMessageReceiver for HttpReceiver {
+    fn create_stream(self) -> Result<impl Stream<Item = String>, Box<dyn std::error::Error>> {
+        Ok(ReceiverStream::new(self.internal))
+    }
+}
+
+async fn async_main() {
+    let sender = CoreSender::new();
+    let receiver = HttpReceiver::new();
+    signal_pipe(sender, receiver).await
 }
 
 async fn handler(
