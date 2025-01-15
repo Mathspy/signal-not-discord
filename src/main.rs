@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     fmt::{self, Write},
+    path::PathBuf,
     time::UNIX_EPOCH,
 };
 
@@ -62,11 +63,7 @@ struct CoreSender {
 }
 
 impl CoreSender {
-    fn new() -> Self {
-        let db_path = std::env::var("DB_PATH").expect("DB_PATH env variable to be set");
-        let signal_user_uuid =
-            std::env::var("SIGNAL_USER_UUID").expect("DB_PATH env variable to be set");
-
+    fn new(user: Uuid, db_path: PathBuf) -> Self {
         let (tx, mut rx) = mpsc::channel(8);
         let rt = runtime::Builder::new_current_thread()
             .enable_all()
@@ -117,15 +114,7 @@ impl CoreSender {
                     };
 
                     manager
-                        .send_message(
-                            ServiceId::Aci(
-                                Uuid::try_parse(&signal_user_uuid)
-                                    .expect("is valid UUID")
-                                    .into(),
-                            ),
-                            message,
-                            timestamp,
-                        )
+                        .send_message(ServiceId::Aci(user.into()), message, timestamp)
                         .await
                         .expect("failed to send message");
 
@@ -220,13 +209,15 @@ struct HttpReceiver {
 }
 
 impl HttpReceiver {
-    fn new() -> Self {
+    fn new(port: u16) -> Self {
         let (tx, rx) = mpsc::channel(8);
-        tokio::spawn(async {
+        tokio::spawn(async move {
             let app = Router::new()
                 .route("/webhooks/:id/:token", routing::post(handler))
                 .with_state(tx);
-            let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+            let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+                .await
+                .unwrap();
             axum::serve(listener, app).await.unwrap();
         });
 
@@ -240,10 +231,41 @@ impl SignalMessageReceiver for HttpReceiver {
     }
 }
 
-async fn async_main() {
-    let sender = CoreSender::new();
-    let receiver = HttpReceiver::new();
-    signal_pipe(sender, receiver).await
+enum Mode {
+    Both {
+        port: u16,
+        signal_user: Uuid,
+        signal_database: PathBuf,
+    },
+}
+
+impl Mode {
+    fn from_env() -> Mode {
+        Mode::Both {
+            port: 3000,
+            signal_user: Uuid::try_parse(
+                &std::env::var("SIGNAL_USER_UUID").expect("SIGNAL_USER_UUID env variable not set"),
+            )
+            .expect("SIGNAL_USER_UUID is not valid UUID"),
+            signal_database: PathBuf::from(
+                std::env::var("DB_PATH").expect("DB_PATH env variable not set"),
+            ),
+        }
+    }
+}
+
+async fn async_main(mode: Mode) {
+    match mode {
+        Mode::Both {
+            port,
+            signal_user,
+            signal_database,
+        } => {
+            let sender = CoreSender::new(signal_user, signal_database);
+            let receiver = HttpReceiver::new(port);
+            signal_pipe(sender, receiver).await
+        }
+    }
 }
 
 async fn handler(
@@ -267,9 +289,10 @@ async fn handler(
 }
 
 fn main() {
+    let mode = Mode::from_env();
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(async { async_main().await })
+        .block_on(async { async_main(mode).await })
 }
