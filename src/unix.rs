@@ -1,4 +1,7 @@
-use std::{io::ErrorKind, path::PathBuf};
+use std::{
+    io::{BufWriter, ErrorKind, Write},
+    path::PathBuf,
+};
 
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -129,8 +132,11 @@ impl UnixSender {
             loop {
                 select! {
                     Some(msg) = rx.recv() => {
-                        let msg = serde_json::to_vec(&JsonRpcMessage { internal: msg })
+                        let mut buf = BufWriter::new(Vec::new());
+                        serde_json::to_writer(&mut buf, &JsonRpcMessage { internal: msg })
                             .expect("messages can be serialized");
+                        buf.write_all(b"\n").expect("writing into a vec shouldn't fail");
+                        let msg = buf.into_inner().expect("unwrapping a buffered vector should be safe");
                         if let Err(error) = stream.write_all(&msg).await {
                             if error.kind() == ErrorKind::BrokenPipe {
                                 println!("Server socket has been closed... shutting down stream...");
