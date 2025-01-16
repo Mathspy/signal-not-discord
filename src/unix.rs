@@ -1,5 +1,6 @@
 use std::{io::ErrorKind, path::PathBuf};
 
+use serde::{Deserialize, Serialize};
 use tokio::{
     fs,
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -11,6 +12,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{shutdown_signal, SignalMessageReceiver, SignalMessageSender};
+
+#[derive(Serialize, Deserialize)]
+struct JsonRpcMessage {
+    #[serde(rename = "i")]
+    internal: String,
+}
 
 pub struct UnixReceiver {
     internal: Receiver<String>,
@@ -28,7 +35,9 @@ impl UnixReceiver {
                     result = reader.read_line(&mut buffer) => {
                         match result {
                             Ok(_) => {
-                                if tx.send(buffer).await.is_err() {
+                                let msg = serde_json::from_str::<JsonRpcMessage>(&buffer)
+                                    .expect("messages can be deserialized");
+                                if tx.send(msg.internal).await.is_err() {
                                     break;
                                 }
                             }
@@ -120,7 +129,9 @@ impl UnixSender {
             loop {
                 select! {
                     Some(msg) = rx.recv() => {
-                        if let Err(error) = stream.write_all(msg.as_ref()).await {
+                        let msg = serde_json::to_vec(&JsonRpcMessage { internal: msg })
+                            .expect("messages can be serialized");
+                        if let Err(error) = stream.write_all(&msg).await {
                             if error.kind() == ErrorKind::BrokenPipe {
                                 println!("Server socket has been closed... shutting down stream...");
                                 break;
