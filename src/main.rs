@@ -23,7 +23,8 @@ use presage_store_sled::{MigrationConflictStrategy, SledStore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
-    runtime,
+    runtime, select,
+    signal::ctrl_c,
     sync::mpsc::{self, Receiver, Sender},
     task::{self, yield_now, LocalSet},
 };
@@ -87,7 +88,7 @@ impl CoreSender {
                     .expect("manager is able to boot up from database correctly");
 
                 let mut receiving_manager = manager.clone();
-                task::spawn_local(async move {
+                let receiving_task = task::spawn_local(async move {
                     let messages = receiving_manager
                         .receive_messages(ReceivingMode::Forever)
                         .await
@@ -101,25 +102,34 @@ impl CoreSender {
 
                 eprintln!("Ready to send messages out!");
 
-                while let Some(msg) = rx.recv().await {
-                    let timestamp = std::time::SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .expect("Time went backwards")
-                        .as_millis() as u64;
+                loop {
+                    select! {
+                        Some(msg) = rx.recv() => {
+                            let timestamp = std::time::SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .expect("Time went backwards")
+                                .as_millis() as u64;
 
-                    let message = DataMessage {
-                        body: Some(msg),
-                        timestamp: Some(timestamp),
-                        ..Default::default()
-                    };
+                            let message = DataMessage {
+                                body: Some(msg),
+                                timestamp: Some(timestamp),
+                                ..Default::default()
+                            };
 
-                    manager
-                        .send_message(ServiceId::Aci(user.into()), message, timestamp)
-                        .await
-                        .expect("failed to send message");
+                            manager
+                                .send_message(ServiceId::Aci(user.into()), message, timestamp)
+                                .await
+                                .expect("failed to send message");
 
-                    eprintln!("Message sent");
+                            eprintln!("Message sent");
+                        }
+                        _ = ctrl_c() => {
+                            break
+                        }
+                    }
                 }
+
+                receiving_task.abort();
             });
 
             rt.block_on(local);
@@ -218,11 +228,18 @@ impl HttpReceiver {
             let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
                 .await
                 .unwrap();
-            axum::serve(listener, app).await.unwrap();
+            axum::serve(listener, app)
+                .with_graceful_shutdown(wait_for_ctrl_c())
+                .await
+                .unwrap();
         });
 
         Self { internal: rx }
     }
+}
+
+async fn wait_for_ctrl_c() {
+    ctrl_c().await.expect("failed to install Ctrl+C handler");
 }
 
 impl SignalMessageReceiver for HttpReceiver {
