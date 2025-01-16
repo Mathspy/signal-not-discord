@@ -4,6 +4,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use serde_json::error;
 use tokio::{
     fs,
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -38,8 +39,19 @@ impl UnixReceiver {
                     result = reader.read_line(&mut buffer) => {
                         match result {
                             Ok(_) => {
-                                let msg = serde_json::from_str::<JsonRpcMessage>(&buffer)
-                                    .expect("messages can be deserialized");
+                                let msg = match serde_json::from_str::<JsonRpcMessage>(&buffer) {
+                                    Ok(msg) => msg,
+                                    Err(error) => {
+                                        if error.classify() == error::Category::Eof {
+                                            println!("Client socket disconnected by sending EOF, winding down stream...");
+                                            break;
+                                        }
+
+                                        eprintln!("Unexpected error while deserializing message: {error}");
+                                        continue;
+                                    },
+                                };
+
                                 if tx.send(msg.internal).await.is_err() {
                                     break;
                                 }
