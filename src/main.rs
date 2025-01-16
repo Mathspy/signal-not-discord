@@ -1,5 +1,6 @@
 mod core;
 mod http;
+mod unix;
 
 use core::CoreSender;
 use std::path::PathBuf;
@@ -7,6 +8,7 @@ use std::path::PathBuf;
 use futures_util::{Stream, StreamExt};
 use http::HttpReceiver;
 use presage::libsignal_service::prelude::Uuid;
+use unix::{UnixReceiver, UnixSender};
 
 trait SignalMessageSender: Clone {
     async fn send(&mut self, msg: String) -> Result<(), Box<dyn std::error::Error>>;
@@ -42,19 +44,41 @@ enum Mode {
         signal_user: Uuid,
         signal_database: PathBuf,
     },
+    Receiver {
+        port: u16,
+        socket: PathBuf,
+    },
+    Sender {
+        socket: PathBuf,
+        signal_user: Uuid,
+        signal_database: PathBuf,
+    },
 }
 
 impl Mode {
     fn from_env() -> Mode {
-        Mode::Both {
-            port: 3000,
-            signal_user: Uuid::try_parse(
-                &std::env::var("SIGNAL_USER_UUID").expect("SIGNAL_USER_UUID env variable not set"),
-            )
-            .expect("SIGNAL_USER_UUID is not valid UUID"),
-            signal_database: PathBuf::from(
-                std::env::var("DB_PATH").expect("DB_PATH env variable not set"),
-            ),
+        let signal = std::env::var("SIGNAL_USER_UUID")
+            .and_then(|signal_user| std::env::var("DB_PATH").map(|db_path| (signal_user, db_path)));
+        let socket = std::env::var("SOCKET_PATH");
+
+        match (signal, socket) {
+            (Ok((signal_user, db_path)), Ok(socket)) => Mode::Sender {
+                socket: PathBuf::from(socket),
+                signal_user: Uuid::try_parse(&signal_user)
+                    .expect("SIGNAL_USER_UUID is not valid UUID"),
+                signal_database: PathBuf::from(db_path),
+            },
+            (Ok((signal_user, db_path)), Err(_)) => Mode::Both {
+                port: 3000,
+                signal_user: Uuid::try_parse(&signal_user)
+                    .expect("SIGNAL_USER_UUID is not valid UUID"),
+                signal_database: PathBuf::from(db_path),
+            },
+            (Err(_), Ok(socket)) => Mode::Receiver {
+                port: 3000,
+                socket: PathBuf::from(socket),
+            },
+            (Err(_), Err(_)) => panic!("Neither SIGNAL_USER_UUID nor SOCKET_PATH was specified"),
         }
     }
 }
@@ -66,8 +90,25 @@ async fn async_main(mode: Mode) {
             signal_user,
             signal_database,
         } => {
+            print!("Running with mode BOTH");
             let sender = CoreSender::new(signal_user, signal_database);
             let receiver = HttpReceiver::new(port);
+            signal_pipe(sender, receiver).await
+        }
+        Mode::Receiver { port, socket } => {
+            print!("Running with mode RECEIVER");
+            let sender = UnixSender::new(socket);
+            let receiver = HttpReceiver::new(port);
+            signal_pipe(sender, receiver).await
+        }
+        Mode::Sender {
+            socket,
+            signal_user,
+            signal_database,
+        } => {
+            print!("Running with mode SENDER");
+            let sender = CoreSender::new(signal_user, signal_database);
+            let receiver = UnixReceiver::new(socket);
             signal_pipe(sender, receiver).await
         }
     }
