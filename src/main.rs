@@ -3,11 +3,12 @@ mod http;
 mod unix;
 
 use core::CoreSender;
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf};
 
 use futures_util::{Stream, StreamExt};
 use http::HttpReceiver;
 use presage::libsignal_service::prelude::Uuid;
+use tokio::signal;
 use unix::{UnixReceiver, UnixSender};
 
 trait SignalMessageSender: Clone {
@@ -111,6 +112,41 @@ async fn async_main(mode: Mode) {
             let receiver = UnixReceiver::new(socket);
             signal_pipe(sender, receiver).await
         }
+    }
+}
+
+#[derive(Debug)]
+enum ExitSignal {
+    SigInt,
+    SigTerm,
+}
+
+impl fmt::Display for ExitSignal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExitSignal::SigInt => f.write_str("SIGINT"),
+            ExitSignal::SigTerm => f.write_str("SIGTERM"),
+        }
+    }
+}
+
+async fn shutdown_signal() -> ExitSignal {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    tokio::select! {
+        _ = ctrl_c => ExitSignal::SigInt,
+        _ = terminate => ExitSignal::SigTerm,
     }
 }
 

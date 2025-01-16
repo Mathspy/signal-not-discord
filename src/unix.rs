@@ -5,13 +5,12 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     select,
-    signal::ctrl_c,
     sync::mpsc::{self, Receiver, Sender},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-use crate::{SignalMessageReceiver, SignalMessageSender};
+use crate::{shutdown_signal, SignalMessageReceiver, SignalMessageSender};
 
 pub struct UnixReceiver {
     internal: Receiver<String>,
@@ -42,7 +41,7 @@ impl UnixReceiver {
                         }
                     }
                     _ = token.cancelled() => {
-                        println!("Exit signal received, winding down unix stream...");
+                        println!("Task instructed to exit, winding down unix stream...");
                         if let Err(error) = reader.into_inner().shutdown().await {
                             eprintln!("Error winding down stream: {error}");
                         }
@@ -71,8 +70,8 @@ impl UnixReceiver {
                             },
                         }
                     }
-                    _ = ctrl_c() => {
-                        println!("Exit signal received, winding down all stream tasks...");
+                    signal = shutdown_signal() => {
+                        println!("Exit signal {signal} received, winding down all stream tasks...");
                         token.cancel();
 
                         break
@@ -128,8 +127,8 @@ impl UnixSender {
                             }
                         }
                     }
-                    _ = ctrl_c() => {
-                        println!("Exit signal received turning off ");
+                    signal = shutdown_signal() => {
+                        println!("Exit signal {signal} received, turning off socket client connect...");
                         break
                     }
                 }

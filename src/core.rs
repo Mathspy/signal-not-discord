@@ -11,12 +11,11 @@ use presage::{
 use presage_store_sled::{MigrationConflictStrategy, SledStore};
 use tokio::{
     runtime, select,
-    signal::ctrl_c,
     sync::mpsc::{self, Sender},
     task::{self, yield_now, LocalSet},
 };
 
-use crate::SignalMessageSender;
+use crate::{shutdown_signal, SignalMessageSender};
 
 #[derive(Clone)]
 pub struct CoreSender {
@@ -85,8 +84,8 @@ impl CoreSender {
 
                             println!("Message sent");
                         }
-                        _ = ctrl_c() => {
-                            println!("Exit signal received, winding down CoreSender");
+                        signal = shutdown_signal() => {
+                            println!("Exit signal {signal} received, winding down CoreSender");
                             break
                         }
                     }

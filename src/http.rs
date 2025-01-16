@@ -9,16 +9,13 @@ use axum::{
     response::{IntoResponse, NoContent},
     routing, Json, Router,
 };
-use futures_util::Stream;
+use futures_util::{FutureExt, Stream};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::{
-    signal::ctrl_c,
-    sync::mpsc::{self, Receiver, Sender},
-};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::SignalMessageReceiver;
+use crate::{shutdown_signal, SignalMessageReceiver};
 
 #[derive(Deserialize, Debug)]
 struct EmbedField {
@@ -101,7 +98,7 @@ impl HttpReceiver {
                 .await
                 .unwrap();
             axum::serve(listener, app)
-                .with_graceful_shutdown(wait_for_ctrl_c())
+                .with_graceful_shutdown(shutdown_signal().map(|_| {}))
                 .await
                 .unwrap();
         });
@@ -128,10 +125,6 @@ async fn handler(
     } else {
         NoContent.into_response()
     }
-}
-
-async fn wait_for_ctrl_c() {
-    ctrl_c().await.expect("failed to install Ctrl+C handler");
 }
 
 impl SignalMessageReceiver for HttpReceiver {
