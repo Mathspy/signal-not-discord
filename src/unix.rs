@@ -42,6 +42,10 @@ impl UnixReceiver {
                         }
                     }
                     _ = token.cancelled() => {
+                        println!("Exit signal received, winding down unix stream...");
+                        if let Err(error) = reader.into_inner().shutdown().await {
+                            eprintln!("Error winding down stream: {error}");
+                        }
                         break;
                     }
                 }
@@ -52,6 +56,7 @@ impl UnixReceiver {
         let (tx, rx) = mpsc::channel(8);
         let tasks = TaskTracker::new();
         let socket = UnixListener::bind(&file).expect("Unable to create socket stream");
+        println!("Created new server on socket {}...", file.display());
 
         tokio::spawn(async move {
             let token = token.clone();
@@ -67,7 +72,9 @@ impl UnixReceiver {
                         }
                     }
                     _ = ctrl_c() => {
+                        println!("Exit signal received, winding down all stream tasks...");
                         token.cancel();
+
                         break
                     },
                 };
@@ -76,10 +83,13 @@ impl UnixReceiver {
             tasks.close();
 
             tasks.wait().await;
+            println!("All stream tasks have exited");
 
             let _ = fs::remove_file(file).await.map_err(|error| {
                 eprintln!("Socket delete error: {error}");
             });
+
+            println!("Freed socket");
         });
 
         UnixReceiver { internal: rx }
@@ -103,18 +113,23 @@ impl UnixSender {
     pub fn new(file: PathBuf) -> Self {
         let (tx, mut rx) = mpsc::channel::<String>(8);
         tokio::spawn(async move {
-            let mut stream = UnixStream::connect(file)
+            let mut stream = UnixStream::connect(&file)
                 .await
                 .expect("Unable to open socket stream");
+            println!("Connected to server on socket {}...", file.display());
 
             loop {
                 select! {
                     Some(msg) = rx.recv() => {
-                        if (stream.write_all(msg.as_ref()).await).is_err() {
-                            break;
+                        if let Err(error) = stream.write_all(msg.as_ref()).await {
+                            if error.kind() == ErrorKind::BrokenPipe {
+                                println!("Server socket has been closed... shutting down stream...");
+                                break;
+                            }
                         }
                     }
                     _ = ctrl_c() => {
+                        println!("Exit signal received turning off ");
                         break
                     }
                 }

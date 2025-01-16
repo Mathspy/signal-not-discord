@@ -32,6 +32,7 @@ impl CoreSender {
             .unwrap();
 
         std::thread::spawn(move || {
+            println!("Started CoreSender on a seprate runtime...");
             let local = LocalSet::new();
 
             local.spawn_local(async move {
@@ -55,12 +56,13 @@ impl CoreSender {
                         .expect("failed to initialize messages stream");
                     pin_mut!(messages);
 
+                    println!("Keeping Signal state up to date now");
                     while (messages.next().await).is_some() {
                         yield_now().await;
                     }
                 });
 
-                eprintln!("Ready to send messages out!");
+                println!("Ready to send messages out!");
 
                 loop {
                     select! {
@@ -81,9 +83,10 @@ impl CoreSender {
                                 .await
                                 .expect("failed to send message");
 
-                            eprintln!("Message sent");
+                            println!("Message sent");
                         }
                         _ = ctrl_c() => {
+                            println!("Exit signal received, winding down CoreSender");
                             break
                         }
                     }

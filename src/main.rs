@@ -90,13 +90,13 @@ async fn async_main(mode: Mode) {
             signal_user,
             signal_database,
         } => {
-            print!("Running with mode BOTH");
+            println!("Running with mode BOTH");
             let sender = CoreSender::new(signal_user, signal_database);
             let receiver = HttpReceiver::new(port);
             signal_pipe(sender, receiver).await
         }
         Mode::Receiver { port, socket } => {
-            print!("Running with mode RECEIVER");
+            println!("Running with mode RECEIVER");
             let sender = UnixSender::new(socket);
             let receiver = HttpReceiver::new(port);
             signal_pipe(sender, receiver).await
@@ -106,7 +106,7 @@ async fn async_main(mode: Mode) {
             signal_user,
             signal_database,
         } => {
-            print!("Running with mode SENDER");
+            println!("Running with mode SENDER");
             let sender = CoreSender::new(signal_user, signal_database);
             let receiver = UnixReceiver::new(socket);
             signal_pipe(sender, receiver).await
