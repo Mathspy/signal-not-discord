@@ -176,6 +176,29 @@ impl UnixSender {
         buf.flush().expect("flushing to vector buffer failed");
     }
 
+    async fn stream_send(stream: UnixStream, buf: &[u8], original_path: &Path) -> UnixStream {
+        let mut stream = stream;
+
+        loop {
+            if let Err(error) = stream.write_all(buf).await {
+                if error.kind() == ErrorKind::BrokenPipe {
+                    println!("Server socket has been closed... restarting stream...");
+
+                    stream = Self::connect_to_stream(original_path).await;
+                    println!(
+                        "Succesfully restablished connection to stream {}",
+                        original_path.display()
+                    );
+                    continue;
+                } else {
+                    panic!("Stream writing returned unexpected error: {error}");
+                }
+            }
+
+            break stream;
+        }
+    }
+
     pub fn new(file: PathBuf) -> Self {
         let (tx, mut rx) = mpsc::channel::<String>(8);
         tokio::spawn(async move {
@@ -189,16 +212,7 @@ impl UnixSender {
                 select! {
                     Some(msg) = rx.recv() => {
                         Self::fill_buffer_with_message(&mut buf, &JsonRpcMessage { internal: msg });
-                        if let Err(error) = stream.write_all(&buf).await {
-                            if error.kind() == ErrorKind::BrokenPipe {
-                                println!("Server socket has been closed... restarting stream...");
-
-                                stream = Self::connect_to_stream(&file).await;
-                                println!("Succesfully restablished connection to stream {}", file.display());
-
-                                stream.write_all(&buf).await.expect("Failed to write to stream after opening a brand new one");
-                            }
-                        }
+                        stream = Self::stream_send(stream, &buf, &file).await;
                     }
                     signal = shutdown_signal() => {
                         println!("Exit signal {signal} received, turning off socket client connect...");
