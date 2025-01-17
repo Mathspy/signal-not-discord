@@ -21,8 +21,8 @@ use crate::{shutdown_signal, SignalMessageReceiver, SignalMessageSender};
 
 #[derive(Serialize, Deserialize)]
 struct JsonRpc {
-    #[serde(rename = "i")]
-    internal: String,
+    #[serde(rename = "c")]
+    content: String,
 }
 
 pub struct UnixReceiver {
@@ -59,7 +59,7 @@ impl UnixReceiver {
                                     },
                                 };
 
-                                if tx.send(msg.internal).await.is_err() {
+                                if tx.send(msg.content).await.is_err() {
                                     break;
                                 }
                             }
@@ -211,7 +211,7 @@ impl UnixSender {
             loop {
                 select! {
                     Some(msg) = rx.recv() => {
-                        Self::fill_buffer_with_message(&mut buf, &JsonRpc { internal: msg });
+                        Self::fill_buffer_with_message(&mut buf, &JsonRpc { content: msg });
                         stream = Self::stream_send(stream, &buf, &file).await;
                     }
                     signal = shutdown_signal() => {
