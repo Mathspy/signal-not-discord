@@ -32,6 +32,11 @@ pub struct UnixReceiver {
 impl UnixReceiver {
     pub fn new(file: PathBuf) -> Self {
         async fn stream_task(stream: UnixStream, tx: Sender<String>, token: CancellationToken) {
+            println!(
+                "Established client connection from task {}",
+                tokio::task::id()
+            );
+
             let mut reader = BufReader::new(stream);
 
             loop {
