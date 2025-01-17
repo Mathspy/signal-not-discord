@@ -1,8 +1,10 @@
 use std::{
     io::{BufWriter, ErrorKind, Write},
     path::PathBuf,
+    time::Duration,
 };
 
+use backoff::ExponentialBackoffBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::error;
 use tokio::{
@@ -136,9 +138,31 @@ impl UnixSender {
     pub fn new(file: PathBuf) -> Self {
         let (tx, mut rx) = mpsc::channel::<String>(8);
         tokio::spawn(async move {
-            let mut stream = UnixStream::connect(&file)
-                .await
-                .expect("Unable to open socket stream");
+            let backoff = ExponentialBackoffBuilder::new()
+                .with_max_elapsed_time(None)
+                .with_max_interval(Duration::from_secs(60))
+                .build();
+
+            let mut stream = backoff::future::retry_notify(
+                backoff,
+                || async {
+                    UnixStream::connect(&file)
+                        .await
+                        .map_err(|error| match error.kind() {
+                            ErrorKind::NotFound => backoff::Error::transient(error),
+                            _ => backoff::Error::permanent(error),
+                        })
+                },
+                |error, duration| {
+                    println!(
+                        "Failed to open socket stream, will retry again in {}: {error}",
+                        fancy_duration::FancyDuration::new(duration).truncate(2)
+                    )
+                },
+            )
+            .await
+            .expect("Unable to open socket stream");
+
             println!("Connected to server on socket {}...", file.display());
 
             loop {

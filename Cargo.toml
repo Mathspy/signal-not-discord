@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 axum = "0.7.9"
+backoff = { version = "0.4.0", features = ["tokio"] }
+fancy-duration = "0.9.2"
 futures-util = { version = "0.3.31", default-features = false }
 presage = { git = "https://github.com/whisperfish/presage" }
 presage-store-sled = { git = "https://github.com/whisperfish/presage" }
