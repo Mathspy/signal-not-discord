@@ -20,7 +20,7 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use crate::{shutdown_signal, SignalMessageReceiver, SignalMessageSender};
 
 #[derive(Serialize, Deserialize)]
-struct JsonRpcMessage {
+struct JsonRpc {
     #[serde(rename = "i")]
     internal: String,
 }
@@ -46,7 +46,7 @@ impl UnixReceiver {
                     result = reader.read_line(&mut buffer) => {
                         match result {
                             Ok(_) => {
-                                let msg = match serde_json::from_str::<JsonRpcMessage>(&buffer) {
+                                let msg = match serde_json::from_str::<JsonRpc>(&buffer) {
                                     Ok(msg) => msg,
                                     Err(error) => {
                                         if error.classify() == error::Category::Eof {
@@ -167,7 +167,7 @@ impl UnixSender {
         .expect("Unable to open socket stream")
     }
 
-    fn fill_buffer_with_message(buf: &mut Vec<u8>, msg: &JsonRpcMessage) {
+    fn fill_buffer_with_message(buf: &mut Vec<u8>, msg: &JsonRpc) {
         buf.clear();
         let mut buf = BufWriter::new(buf);
         serde_json::to_writer(&mut buf, &msg).expect("messages can be serialized");
@@ -211,7 +211,7 @@ impl UnixSender {
             loop {
                 select! {
                     Some(msg) = rx.recv() => {
-                        Self::fill_buffer_with_message(&mut buf, &JsonRpcMessage { internal: msg });
+                        Self::fill_buffer_with_message(&mut buf, &JsonRpc { internal: msg });
                         stream = Self::stream_send(stream, &buf, &file).await;
                     }
                     signal = shutdown_signal() => {
