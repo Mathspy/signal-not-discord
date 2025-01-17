@@ -1,5 +1,6 @@
 use std::{
     io::{BufWriter, ErrorKind, Write},
+    ops::ControlFlow,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -30,6 +31,27 @@ pub struct UnixReceiver {
 }
 
 impl UnixReceiver {
+    async fn handle_incoming_message(tx: &Sender<String>, buffer: &str) -> ControlFlow<(), ()> {
+        let msg = match serde_json::from_str::<JsonRpc>(buffer) {
+            Ok(msg) => msg,
+            Err(error) => {
+                if error.classify() == error::Category::Eof {
+                    println!("Client socket disconnected by sending EOF, winding down stream...");
+                    return ControlFlow::Break(());
+                }
+
+                eprintln!("Unexpected error while deserializing message: {error}");
+                return ControlFlow::Continue(());
+            }
+        };
+
+        if tx.send(msg.content).await.is_err() {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+
     pub fn new(file: PathBuf) -> Self {
         async fn stream_task(stream: UnixStream, tx: Sender<String>, token: CancellationToken) {
             println!(
@@ -46,21 +68,9 @@ impl UnixReceiver {
                     result = reader.read_line(&mut buffer) => {
                         match result {
                             Ok(_) => {
-                                let msg = match serde_json::from_str::<JsonRpc>(&buffer) {
-                                    Ok(msg) => msg,
-                                    Err(error) => {
-                                        if error.classify() == error::Category::Eof {
-                                            println!("Client socket disconnected by sending EOF, winding down stream...");
-                                            break;
-                                        }
-
-                                        eprintln!("Unexpected error while deserializing message: {error}");
-                                        continue;
-                                    },
-                                };
-
-                                if tx.send(msg.content).await.is_err() {
-                                    break;
+                                match UnixReceiver::handle_incoming_message(&tx, &buffer).await {
+                                    ControlFlow::Continue(_) => continue,
+                                    ControlFlow::Break(_) => break,
                                 }
                             }
                             Err(error) => {
