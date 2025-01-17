@@ -11,7 +11,7 @@ use serde_json::error;
 use tokio::{
     fs,
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{unix::WriteHalf, UnixListener, UnixStream},
+    net::{UnixListener, UnixStream},
     select,
     sync::mpsc::{self, Receiver, Sender},
 };
@@ -27,7 +27,6 @@ enum JsonRpc {
         content: String,
     },
     Ping,
-    Pong,
 }
 
 pub struct UnixReceiver {
@@ -36,10 +35,9 @@ pub struct UnixReceiver {
 
 impl UnixReceiver {
     async fn handle_incoming_message<'a>(
-        mut writer: WriteHalf<'a>,
         tx: &Sender<String>,
         buffer: &[u8],
-    ) -> ControlFlow<(), WriteHalf<'a>> {
+    ) -> ControlFlow<(), ()> {
         let msg = match serde_json::from_slice::<JsonRpc>(buffer) {
             Ok(msg) => msg,
             Err(error) => {
@@ -49,7 +47,7 @@ impl UnixReceiver {
                 }
 
                 eprintln!("Unexpected error while deserializing message: {error}");
-                return ControlFlow::Continue(writer);
+                return ControlFlow::Continue(());
             }
         };
 
@@ -58,36 +56,21 @@ impl UnixReceiver {
                 if tx.send(content).await.is_err() {
                     ControlFlow::Break(())
                 } else {
-                    ControlFlow::Continue(writer)
+                    ControlFlow::Continue(())
                 }
             }
-            JsonRpc::Ping => {
-                let mut buf = BufWriter::new(Vec::new());
-                serde_json::to_writer(&mut buf, &JsonRpc::Pong)
-                    .expect("messages can be serialized");
-                buf.write_all(b"\n")
-                    .expect("writing into a vec shouldn't fail");
-                buf.flush().expect("flushing to vector buffer failed");
-                writer
-                    .write_all(&buf.into_inner().unwrap())
-                    .await
-                    .expect("responding with pong failed");
-
-                ControlFlow::Continue(writer)
-            }
-            JsonRpc::Pong => ControlFlow::Continue(writer),
+            JsonRpc::Ping => ControlFlow::Continue(()),
         }
     }
 
     pub fn new(file: PathBuf) -> Self {
-        async fn stream_task(mut stream: UnixStream, tx: Sender<String>, token: CancellationToken) {
+        async fn stream_task(stream: UnixStream, tx: Sender<String>, token: CancellationToken) {
             println!(
                 "Established client connection from task {}",
                 tokio::task::id()
             );
 
-            let (reader, mut writer) = stream.split();
-            let mut reader = BufReader::new(reader);
+            let mut reader = BufReader::new(stream);
 
             let mut buf = Vec::new();
 
@@ -98,11 +81,8 @@ impl UnixReceiver {
                     result = reader.read_until(b'\n', &mut buf) => {
                         match result {
                             Ok(_) => {
-                                match UnixReceiver::handle_incoming_message(writer, &tx, &buf).await {
-                                    ControlFlow::Continue(w) => {
-                                        writer = w;
-                                        continue
-                                    },
+                                match UnixReceiver::handle_incoming_message(&tx, &buf).await {
+                                    ControlFlow::Continue(_) => continue,
                                     ControlFlow::Break(_) => break,
                                 }
                             }
@@ -115,9 +95,8 @@ impl UnixReceiver {
                         }
                     }
                     _ = token.cancelled() => {
-                        drop(reader);
                         println!("Task instructed to exit, winding down unix stream...");
-                        if let Err(error) = stream.shutdown().await {
+                        if let Err(error) = reader.into_inner().shutdown().await {
                             eprintln!("Error winding down stream: {error}");
                         }
                         break;
@@ -249,49 +228,6 @@ impl UnixSender {
         }
     }
 
-    async fn wait_for_pong(
-        stream: UnixStream,
-        buf: &mut Vec<u8>,
-        original_path: &Path,
-    ) -> UnixStream {
-        buf.clear();
-        let mut stream = stream;
-
-        loop {
-            let mut reader = BufReader::new(&mut stream);
-            match reader.read_until(b'\n', buf).await {
-                Ok(_) => {}
-                Err(error) => {
-                    stream = Self::handle_io_error(error, original_path).await;
-                    continue;
-                }
-            }
-
-            let msg = match serde_json::from_slice::<JsonRpc>(buf) {
-                Ok(msg) => msg,
-                Err(error) => {
-                    if error.classify() == error::Category::Eof {
-                        stream = Self::connect_to_stream(original_path).await;
-                        continue;
-                    }
-
-                    panic!("Unexpected error while deserializing message: {error}");
-                }
-            };
-
-            match msg {
-                JsonRpc::Pong => {
-                    // success...
-                }
-                weird => {
-                    eprintln!("Unexpected message {weird:?} while waiting for pong");
-                }
-            }
-
-            break stream;
-        }
-    }
-
     pub fn new(file: PathBuf) -> Self {
         let (tx, mut rx) = mpsc::channel::<String>(8);
         tokio::spawn(async move {
@@ -312,7 +248,6 @@ impl UnixSender {
                     _ = ping_interval.tick() => {
                         Self::fill_buffer_with_message(&mut buf, &JsonRpc::Ping);
                         stream = Self::stream_send(stream, &buf, &file).await;
-                        stream = Self::wait_for_pong(stream, &mut buf, &file).await;
                     }
                     signal = shutdown_signal() => {
                         println!("Exit signal {signal} received, turning off socket client connect...");
