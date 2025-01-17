@@ -1,6 +1,6 @@
 use std::{
     io::{BufWriter, ErrorKind, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -135,33 +135,37 @@ pub struct UnixSender {
 }
 
 impl UnixSender {
+    async fn connect_to_stream(file: &Path) -> UnixStream {
+        let backoff = ExponentialBackoffBuilder::new()
+            .with_max_elapsed_time(None)
+            .with_max_interval(Duration::from_secs(60))
+            .build();
+
+        backoff::future::retry_notify(
+            backoff,
+            || async {
+                UnixStream::connect(&file)
+                    .await
+                    .map_err(|error| match error.kind() {
+                        ErrorKind::NotFound => backoff::Error::transient(error),
+                        _ => backoff::Error::permanent(error),
+                    })
+            },
+            |error, duration| {
+                println!(
+                    "Failed to open socket stream, will retry again in {}: {error}",
+                    fancy_duration::FancyDuration::new(duration).truncate(2)
+                )
+            },
+        )
+        .await
+        .expect("Unable to open socket stream")
+    }
+
     pub fn new(file: PathBuf) -> Self {
         let (tx, mut rx) = mpsc::channel::<String>(8);
         tokio::spawn(async move {
-            let backoff = ExponentialBackoffBuilder::new()
-                .with_max_elapsed_time(None)
-                .with_max_interval(Duration::from_secs(60))
-                .build();
-
-            let mut stream = backoff::future::retry_notify(
-                backoff,
-                || async {
-                    UnixStream::connect(&file)
-                        .await
-                        .map_err(|error| match error.kind() {
-                            ErrorKind::NotFound => backoff::Error::transient(error),
-                            _ => backoff::Error::permanent(error),
-                        })
-                },
-                |error, duration| {
-                    println!(
-                        "Failed to open socket stream, will retry again in {}: {error}",
-                        fancy_duration::FancyDuration::new(duration).truncate(2)
-                    )
-                },
-            )
-            .await
-            .expect("Unable to open socket stream");
+            let mut stream = Self::connect_to_stream(&file).await;
 
             println!("Connected to server on socket {}...", file.display());
 
@@ -175,8 +179,12 @@ impl UnixSender {
                         let msg = buf.into_inner().expect("unwrapping a buffered vector should be safe");
                         if let Err(error) = stream.write_all(&msg).await {
                             if error.kind() == ErrorKind::BrokenPipe {
-                                println!("Server socket has been closed... shutting down stream...");
-                                break;
+                                println!("Server socket has been closed... restarting stream...");
+
+                                stream = Self::connect_to_stream(&file).await;
+                                println!("Succesfully restablished connection to stream {}", file.display());
+
+                                stream.write_all(&msg).await.expect("Failed to write to stream after opening a brand new one");
                             }
                         }
                     }
