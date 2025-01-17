@@ -1,5 +1,5 @@
 use std::{
-    io::{BufWriter, ErrorKind, Write},
+    io::{self, BufWriter, ErrorKind, Write},
     ops::ControlFlow,
     path::{Path, PathBuf},
     time::Duration,
@@ -11,7 +11,7 @@ use serde_json::error;
 use tokio::{
     fs,
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{UnixListener, UnixStream},
+    net::{unix::WriteHalf, UnixListener, UnixStream},
     select,
     sync::mpsc::{self, Receiver, Sender},
 };
@@ -20,10 +20,14 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{shutdown_signal, SignalMessageReceiver, SignalMessageSender};
 
-#[derive(Serialize, Deserialize)]
-struct JsonRpc {
-    #[serde(rename = "c")]
-    content: String,
+#[derive(Serialize, Deserialize, Debug)]
+enum JsonRpc {
+    Message {
+        #[serde(rename = "c")]
+        content: String,
+    },
+    Ping,
+    Pong,
 }
 
 pub struct UnixReceiver {
@@ -31,7 +35,11 @@ pub struct UnixReceiver {
 }
 
 impl UnixReceiver {
-    async fn handle_incoming_message(tx: &Sender<String>, buffer: &str) -> ControlFlow<(), ()> {
+    async fn handle_incoming_message<'a>(
+        mut writer: WriteHalf<'a>,
+        tx: &Sender<String>,
+        buffer: &str,
+    ) -> ControlFlow<(), WriteHalf<'a>> {
         let msg = match serde_json::from_str::<JsonRpc>(buffer) {
             Ok(msg) => msg,
             Err(error) => {
@@ -41,25 +49,45 @@ impl UnixReceiver {
                 }
 
                 eprintln!("Unexpected error while deserializing message: {error}");
-                return ControlFlow::Continue(());
+                return ControlFlow::Continue(writer);
             }
         };
 
-        if tx.send(msg.content).await.is_err() {
-            ControlFlow::Break(())
-        } else {
-            ControlFlow::Continue(())
+        match msg {
+            JsonRpc::Message { content } => {
+                if tx.send(content).await.is_err() {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(writer)
+                }
+            }
+            JsonRpc::Ping => {
+                let mut buf = BufWriter::new(Vec::new());
+                serde_json::to_writer(&mut buf, &JsonRpc::Pong)
+                    .expect("messages can be serialized");
+                buf.write_all(b"\n")
+                    .expect("writing into a vec shouldn't fail");
+                buf.flush().expect("flushing to vector buffer failed");
+                writer
+                    .write_all(&buf.into_inner().unwrap())
+                    .await
+                    .expect("responding with pong failed");
+
+                ControlFlow::Continue(writer)
+            }
+            JsonRpc::Pong => ControlFlow::Continue(writer),
         }
     }
 
     pub fn new(file: PathBuf) -> Self {
-        async fn stream_task(stream: UnixStream, tx: Sender<String>, token: CancellationToken) {
+        async fn stream_task(mut stream: UnixStream, tx: Sender<String>, token: CancellationToken) {
             println!(
                 "Established client connection from task {}",
                 tokio::task::id()
             );
 
-            let mut reader = BufReader::new(stream);
+            let (reader, mut writer) = stream.split();
+            let mut reader = BufReader::new(reader);
 
             loop {
                 let mut buffer = String::new();
@@ -68,8 +96,11 @@ impl UnixReceiver {
                     result = reader.read_line(&mut buffer) => {
                         match result {
                             Ok(_) => {
-                                match UnixReceiver::handle_incoming_message(&tx, &buffer).await {
-                                    ControlFlow::Continue(_) => continue,
+                                match UnixReceiver::handle_incoming_message(writer, &tx, &buffer).await {
+                                    ControlFlow::Continue(w) => {
+                                        writer = w;
+                                        continue
+                                    },
                                     ControlFlow::Break(_) => break,
                                 }
                             }
@@ -82,8 +113,9 @@ impl UnixReceiver {
                         }
                     }
                     _ = token.cancelled() => {
+                        drop(reader);
                         println!("Task instructed to exit, winding down unix stream...");
-                        if let Err(error) = reader.into_inner().shutdown().await {
+                        if let Err(error) = stream.shutdown().await {
                             eprintln!("Error winding down stream: {error}");
                         }
                         break;
@@ -186,22 +218,71 @@ impl UnixSender {
         buf.flush().expect("flushing to vector buffer failed");
     }
 
+    async fn handle_io_error(error: io::Error, original_path: &Path) -> UnixStream {
+        if error.kind() == ErrorKind::BrokenPipe {
+            println!("Server socket has been closed... restarting stream...");
+
+            let stream = Self::connect_to_stream(original_path).await;
+            println!(
+                "Succesfully restablished connection to stream {}",
+                original_path.display()
+            );
+
+            stream
+        } else {
+            panic!("Stream writing returned unexpected error: {error}");
+        }
+    }
+
     async fn stream_send(stream: UnixStream, buf: &[u8], original_path: &Path) -> UnixStream {
         let mut stream = stream;
 
         loop {
             if let Err(error) = stream.write_all(buf).await {
-                if error.kind() == ErrorKind::BrokenPipe {
-                    println!("Server socket has been closed... restarting stream...");
+                stream = Self::handle_io_error(error, original_path).await;
+                continue;
+            }
 
-                    stream = Self::connect_to_stream(original_path).await;
-                    println!(
-                        "Succesfully restablished connection to stream {}",
-                        original_path.display()
-                    );
+            break stream;
+        }
+    }
+
+    async fn wait_for_pong(
+        stream: UnixStream,
+        buf: &mut Vec<u8>,
+        original_path: &Path,
+    ) -> UnixStream {
+        buf.clear();
+        let mut stream = stream;
+
+        loop {
+            let mut reader = BufReader::new(&mut stream);
+            match reader.read_until(b'\n', buf).await {
+                Ok(_) => {}
+                Err(error) => {
+                    stream = Self::handle_io_error(error, original_path).await;
                     continue;
-                } else {
-                    panic!("Stream writing returned unexpected error: {error}");
+                }
+            }
+
+            let msg = match serde_json::from_slice::<JsonRpc>(buf) {
+                Ok(msg) => msg,
+                Err(error) => {
+                    if error.classify() == error::Category::Eof {
+                        stream = Self::connect_to_stream(original_path).await;
+                        continue;
+                    }
+
+                    panic!("Unexpected error while deserializing message: {error}");
+                }
+            };
+
+            match msg {
+                JsonRpc::Pong => {
+                    // success...
+                }
+                weird => {
+                    eprintln!("Unexpected message {weird:?} while waiting for pong");
                 }
             }
 
@@ -216,13 +297,20 @@ impl UnixSender {
 
             println!("Connected to server on socket {}...", file.display());
 
+            let mut ping_interval = tokio::time::interval(Duration::from_secs(5));
+
             let mut buf = Vec::new();
 
             loop {
                 select! {
                     Some(msg) = rx.recv() => {
-                        Self::fill_buffer_with_message(&mut buf, &JsonRpc { content: msg });
+                        Self::fill_buffer_with_message(&mut buf, &JsonRpc::Message { content: msg });
                         stream = Self::stream_send(stream, &buf, &file).await;
+                    }
+                    _ = ping_interval.tick() => {
+                        Self::fill_buffer_with_message(&mut buf, &JsonRpc::Ping);
+                        stream = Self::stream_send(stream, &buf, &file).await;
+                        stream = Self::wait_for_pong(stream, &mut buf, &file).await;
                     }
                     signal = shutdown_signal() => {
                         println!("Exit signal {signal} received, turning off socket client connect...");
