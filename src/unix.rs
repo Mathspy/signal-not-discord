@@ -38,9 +38,9 @@ impl UnixReceiver {
     async fn handle_incoming_message<'a>(
         mut writer: WriteHalf<'a>,
         tx: &Sender<String>,
-        buffer: &str,
+        buffer: &[u8],
     ) -> ControlFlow<(), WriteHalf<'a>> {
-        let msg = match serde_json::from_str::<JsonRpc>(buffer) {
+        let msg = match serde_json::from_slice::<JsonRpc>(buffer) {
             Ok(msg) => msg,
             Err(error) => {
                 if error.classify() == error::Category::Eof {
@@ -89,14 +89,16 @@ impl UnixReceiver {
             let (reader, mut writer) = stream.split();
             let mut reader = BufReader::new(reader);
 
+            let mut buf = Vec::new();
+
             loop {
-                let mut buffer = String::new();
+                buf.clear();
 
                 select! {
-                    result = reader.read_line(&mut buffer) => {
+                    result = reader.read_until(b'\n', &mut buf) => {
                         match result {
                             Ok(_) => {
-                                match UnixReceiver::handle_incoming_message(writer, &tx, &buffer).await {
+                                match UnixReceiver::handle_incoming_message(writer, &tx, &buf).await {
                                     ControlFlow::Continue(w) => {
                                         writer = w;
                                         continue
