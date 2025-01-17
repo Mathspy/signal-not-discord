@@ -167,6 +167,15 @@ impl UnixSender {
         .expect("Unable to open socket stream")
     }
 
+    fn fill_buffer_with_message(buf: &mut Vec<u8>, msg: &JsonRpcMessage) {
+        buf.clear();
+        let mut buf = BufWriter::new(buf);
+        serde_json::to_writer(&mut buf, &msg).expect("messages can be serialized");
+        buf.write_all(b"\n")
+            .expect("writing into a vec shouldn't fail");
+        buf.flush().expect("flushing to vector buffer failed");
+    }
+
     pub fn new(file: PathBuf) -> Self {
         let (tx, mut rx) = mpsc::channel::<String>(8);
         tokio::spawn(async move {
@@ -174,22 +183,20 @@ impl UnixSender {
 
             println!("Connected to server on socket {}...", file.display());
 
+            let mut buf = Vec::new();
+
             loop {
                 select! {
                     Some(msg) = rx.recv() => {
-                        let mut buf = BufWriter::new(Vec::new());
-                        serde_json::to_writer(&mut buf, &JsonRpcMessage { internal: msg })
-                            .expect("messages can be serialized");
-                        buf.write_all(b"\n").expect("writing into a vec shouldn't fail");
-                        let msg = buf.into_inner().expect("unwrapping a buffered vector should be safe");
-                        if let Err(error) = stream.write_all(&msg).await {
+                        Self::fill_buffer_with_message(&mut buf, &JsonRpcMessage { internal: msg });
+                        if let Err(error) = stream.write_all(&buf).await {
                             if error.kind() == ErrorKind::BrokenPipe {
                                 println!("Server socket has been closed... restarting stream...");
 
                                 stream = Self::connect_to_stream(&file).await;
                                 println!("Succesfully restablished connection to stream {}", file.display());
 
-                                stream.write_all(&msg).await.expect("Failed to write to stream after opening a brand new one");
+                                stream.write_all(&buf).await.expect("Failed to write to stream after opening a brand new one");
                             }
                         }
                     }
