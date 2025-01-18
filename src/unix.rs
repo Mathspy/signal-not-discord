@@ -181,7 +181,9 @@ impl UnixSender {
                 UnixStream::connect(&file)
                     .await
                     .map_err(|error| match error.kind() {
-                        ErrorKind::NotFound => backoff::Error::transient(error),
+                        ErrorKind::NotFound | ErrorKind::ConnectionRefused => {
+                            backoff::Error::transient(error)
+                        }
                         _ => backoff::Error::permanent(error),
                     })
             },
