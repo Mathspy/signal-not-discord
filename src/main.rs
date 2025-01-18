@@ -29,6 +29,7 @@ where
         .expect("creating stream failed")
         .for_each(|msg| {
             let mut sender = sender.clone();
+            println!("Piping message to other side");
             async move {
                 sender
                     .send(msg)

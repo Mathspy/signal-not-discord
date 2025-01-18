@@ -2,6 +2,7 @@ use std::{
     io::{self, BufWriter, ErrorKind, Write},
     ops::ControlFlow,
     path::{Path, PathBuf},
+    process,
     time::Duration,
 };
 
@@ -54,7 +55,8 @@ impl UnixReceiver {
         match msg {
             JsonRpc::Message { content } => {
                 if tx.send(content).await.is_err() {
-                    ControlFlow::Break(())
+                    eprintln!("FATAL ERROR: couldn't send a message to core, restarting...");
+                    process::exit(1)
                 } else {
                     ControlFlow::Continue(())
                 }
@@ -88,6 +90,10 @@ impl UnixReceiver {
                             }
                             Err(error) => {
                                 if error.kind() == ErrorKind::BrokenPipe {
+                                    println!(
+                                        "Connection to client has been broken, winding down task {}...",
+                                        tokio::task::id()
+                                    );
                                     break;
                                 }
                                 eprintln!("Read line error: {error}");
